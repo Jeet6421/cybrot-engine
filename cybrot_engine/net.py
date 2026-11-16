@@ -9,7 +9,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-USER_AGENT = "CYBROT-OSINT/0.2 (local engine; passive by default)"
+USER_AGENT = "CYBROT-OSINT/0.3 (local engine; passive by default)"
+PROBE_SOURCE = "Live HTTPS GET, one request per name, no redirects (authorized scan)"
 MAX_BYTES = 2_000_000
 DOH_ENDPOINTS = ("https://cloudflare-dns.com/dns-query", "https://dns.google/resolve")
 DOMAIN_RE = re.compile(r"^(?=.{1,253}$)((?!-)[a-z0-9-]{1,63}(?<!-)\.)+[a-z]{2,63}$")
@@ -43,10 +44,9 @@ def normalize_domain(raw):
     return text
 
 
-def fetch_json(url, timeout=15, accept="application/json", allow_404=True):
-    request = urllib.request.Request(
-        url, headers={"User-Agent": USER_AGENT, "Accept": accept}
-    )
+def fetch_json(url, timeout=15, accept="application/json", allow_404=True, headers=None):
+    request_headers = {"User-Agent": USER_AGENT, "Accept": accept, **(headers or {})}
+    request = urllib.request.Request(url, headers=request_headers)
     host = urllib.parse.urlsplit(url).netloc
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -159,3 +159,18 @@ def http_headers(host, timeout=10):
         "headers": {name: headers.get(name) for name in SECURITY_HEADERS},
         "source": "Live HTTP GET, one request, no redirects (authorized scan)",
     }
+
+
+def http_probe(host, timeout=8):
+    """Live check for one discovered name: one GET over HTTPS, no redirects followed, status and Server header only."""
+    public_address(host)  # raises TargetError for loopback, private or link-local addresses
+    opener = urllib.request.build_opener(_NoRedirect)
+    request = urllib.request.Request(f"https://{host}/", headers={"User-Agent": USER_AGENT})
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status, server = response.status, response.headers.get("Server")
+    except urllib.error.HTTPError as err:
+        status, server = err.code, err.headers.get("Server")
+    except (urllib.error.URLError, OSError) as err:
+        raise NetError(f"No HTTPS answer from {host}: {getattr(err, 'reason', err)}.")
+    return {"host": host, "status": status, "server": server, "source": PROBE_SOURCE}

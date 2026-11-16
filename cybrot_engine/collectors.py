@@ -1,7 +1,9 @@
 """Passive collectors. Each function turns one public source's answer into findings with a source label."""
 import datetime as dt
+import os
 import re
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 
 from . import net
 
@@ -171,3 +173,113 @@ def _utc(text):
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
     return parsed.isoformat()
+
+
+# ---- name resolution (DNS only; no connection is made to the names) ----
+
+DNS_WORKERS = 8
+
+
+def resolve_names(names):
+    """Ask whether each name has an IPv4 address. Returns {name: {resolves, addresses, error}}."""
+
+    def check(name):
+        try:
+            answer = net.doh_query(name, "A")
+        except net.NetError as err:
+            return name, {"resolves": None, "addresses": [], "error": str(err)}
+        addresses = [str(item.get("data", "")) for item in answer.get("Answer") or [] if item.get("type") == 1]
+        return name, {"resolves": bool(addresses), "addresses": addresses, "error": None}
+
+    with ThreadPoolExecutor(max_workers=DNS_WORKERS) as pool:
+        return dict(pool.map(check, names))
+
+
+# ---- threat intelligence (needs an API key set on the engine's computer) ----
+
+VT_URL = "https://www.virustotal.com/api/v3/domains/{domain}"
+OTX_URL = "https://otx.alienvault.com/api/v1/indicators/domain/{domain}/general"
+VT_SOURCE = "VirusTotal domain report (engine's own API key)"
+OTX_SOURCE = "AlienVault OTX domain indicator (engine's own API key)"
+THREAT_ENV = {"virustotal": "CYBROT_VT_API_KEY", "otx": "CYBROT_OTX_API_KEY"}
+THREAT_NAMES = {"virustotal": "VirusTotal", "otx": "AlienVault OTX"}
+
+
+def configured_threat_keys(env=None):
+    """Keys come only from environment variables on the engine's computer. They are never returned by the API."""
+    env = os.environ if env is None else env
+    return {name: (env.get(var) or "").strip() for name, var in THREAT_ENV.items() if (env.get(var) or "").strip()}
+
+
+def _count(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _unix_iso(value):
+    try:
+        return dt.datetime.fromtimestamp(int(value), dt.timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def virustotal_domain(domain, key):
+    data = net.fetch_json(VT_URL.format(domain=urllib.parse.quote(domain)), headers={"x-apikey": key})
+    if data is None:
+        return {"provider": THREAT_NAMES["virustotal"], "found": False, "source": VT_SOURCE}
+    attrs = (data.get("data") or {}).get("attributes") or {}
+    stats = attrs.get("last_analysis_stats") or {}
+    return {
+        "provider": THREAT_NAMES["virustotal"],
+        "found": True,
+        "malicious": _count(stats.get("malicious")),
+        "suspicious": _count(stats.get("suspicious")),
+        "harmless": _count(stats.get("harmless")),
+        "undetected": _count(stats.get("undetected")),
+        "engines_total": sum(_count(value) for value in stats.values()),
+        "reputation": attrs.get("reputation"),
+        "last_analysis": _unix_iso(attrs.get("last_analysis_date")),
+        "source": VT_SOURCE,
+    }
+
+
+def otx_domain(domain, key):
+    data = net.fetch_json(OTX_URL.format(domain=urllib.parse.quote(domain)), headers={"X-OTX-API-KEY": key})
+    if data is None:
+        return {"provider": THREAT_NAMES["otx"], "found": False, "source": OTX_SOURCE}
+    pulses = _count((data.get("pulse_info") or {}).get("count"))
+    return {"provider": THREAT_NAMES["otx"], "found": True, "pulses": pulses, "source": OTX_SOURCE}
+
+
+PROVIDERS = {"virustotal": virustotal_domain, "otx": otx_domain}
+
+
+def threat_intel(domain, env=None):
+    """Ask each configured provider about the domain. Verdicts: flagged, mentioned, no_findings, no_data."""
+    keys = configured_threat_keys(env)
+    if not keys:
+        return {"verdict": "not_configured", "providers": [], "errors": [], "checked_at": None}
+    providers, errors = [], []
+    for name, key in keys.items():
+        try:
+            providers.append(PROVIDERS[name](domain, key))
+        except net.NetError as err:
+            errors.append(f"{THREAT_NAMES[name]}: {err}")
+    if not providers:
+        raise net.NetError("; ".join(errors))
+    if any(p.get("malicious", 0) > 0 for p in providers):
+        verdict = "flagged"
+    elif any(p.get("suspicious", 0) > 0 or p.get("pulses", 0) > 0 for p in providers):
+        verdict = "mentioned"
+    elif any(p.get("found") for p in providers):
+        verdict = "no_findings"
+    else:
+        verdict = "no_data"
+    return {
+        "verdict": verdict,
+        "providers": providers,
+        "errors": errors,
+        "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }

@@ -4,12 +4,18 @@ import threading
 import time
 import traceback
 
-from . import collectors, net
+from . import collectors, net, report
 
-PASSIVE_MODULES = ["whois", "dns", "subdomains", "ssl"]
+PASSIVE_MODULES = ["whois", "dns", "subdomains", "ssl", "hosts", "threat"]
 LIVE_MODULES = ["headers"]
-ORDER = ["whois", "dns", "subdomains", "ssl", "headers"]
+ORDER = ["whois", "dns", "subdomains", "ssl", "hosts", "threat", "headers"]
 ALLOWED_MODULES = set(ORDER)
+MAX_HOST_CHECKS = 100  # names checked in DNS per scan
+MAX_LIVE_PROBES = 25  # names contacted over HTTPS per authorized scan
+
+
+class SkipModule(Exception):
+    """A module that cannot run in this setup, such as a missing API key. Shown as skipped, not failed."""
 
 
 def _utc_iso(timestamp):
@@ -33,7 +39,10 @@ class ScanJob:
         self.id = scan_id
         self.domain = domain
         self.live = bool(live)
-        self.requested = [m for m in ORDER if m in modules and (self.live or m not in LIVE_MODULES)]
+        chosen = set(modules)
+        if "hosts" in chosen:
+            chosen.add("subdomains")  # name checks need the names that certificate logs provide
+        self.requested = [m for m in ORDER if m in chosen and (self.live or m not in LIVE_MODULES)]
         self.status = "running"
         self.progress = 0
         self.modules = {name: {"status": "queued"} for name in self.requested}
@@ -82,6 +91,8 @@ class ScanJob:
             try:
                 count = getattr(self, "_collect_" + name)()
                 self._set_module(name, status="done", count=count)
+            except SkipModule as note:
+                self._set_module(name, status="skipped", message=str(note))
             except net.NetError as err:
                 self._set_module(name, status="failed", message=str(err))
             except Exception:  # keep the engine alive; the console shows the detail
@@ -99,7 +110,8 @@ class ScanJob:
                 info["count"] = count
             if message:
                 info["message"] = message
-                self.results["warnings"].append(f"{name}: {message}")
+                if status == "failed":
+                    self.results["warnings"].append(f"{name}: {message}")
             self.modules[name] = info
 
     def _finish(self):
@@ -111,12 +123,13 @@ class ScanJob:
             elif "done" in statuses:
                 self.status = "completed"
                 self.progress = 100
+                self.results["observations"] = report.observations(self.results, self.modules)
             else:
                 self.status = "failed"
-                failures = [info.get("message") for info in self.modules.values() if info.get("message")]
+                messages = [info.get("message") for info in self.modules.values() if info.get("message")]
                 self.error = {
                     "code": "ALL_SOURCES_FAILED",
-                    "message": failures[0] if failures else "No source returned data for this domain.",
+                    "message": messages[0] if messages else "No source returned data for this domain.",
                 }
 
     # ---- collectors: each returns the count shown next to its module ----
@@ -168,6 +181,60 @@ class ScanJob:
             except net.NetError as err:
                 self.results["live"]["tls_error"] = str(err)
         return len(certs)
+
+    def _collect_hosts(self):
+        details = self.results.get("subdomain_details") or []
+        if not details:
+            raise SkipModule("No names were found in certificate logs, so there is nothing to check.")
+        checked = details[:MAX_HOST_CHECKS]
+        resolved = collectors.resolve_names([item["name"] for item in checked])
+        unknown = 0
+        for item in checked:
+            info = resolved[item["name"]]
+            item["resolves"] = info["resolves"]
+            item["addresses"] = info["addresses"]
+            if info["resolves"] is None:
+                unknown += 1
+        if unknown == len(checked):
+            raise net.NetError("No DNS resolver answered, so the names could not be checked.")
+        resolving = sum(1 for item in checked if item["resolves"])
+        self.results["hosts"] = {
+            "checked": len(checked),
+            "truncated": len(details) > MAX_HOST_CHECKS,
+            "resolving": resolving,
+            "unknown": unknown,
+            "source": collectors.DNS_SOURCE,
+        }
+        if self.live:
+            self._probe_live_hosts(checked)
+        return resolving
+
+    def _probe_live_hosts(self, checked):
+        """Authorized scans only: one HTTPS request to each resolving name, up to the probe limit."""
+        candidates = [item for item in checked if item.get("resolves")][:MAX_LIVE_PROBES]
+        responding = 0
+        for item in candidates:
+            if self._cancel.is_set():
+                break
+            try:
+                probe = net.http_probe(item["name"])
+                item.update(verified_live=True, http_status=probe["status"], server=probe["server"])
+                responding += 1
+            except net.NetError as err:
+                item.update(verified_live=False, probe_error=str(err))
+        self.results["live"]["hosts"] = {
+            "probed": len(candidates),
+            "responding": responding,
+            "limit": MAX_LIVE_PROBES,
+            "source": net.PROBE_SOURCE,
+        }
+
+    def _collect_threat(self):
+        result = collectors.threat_intel(self.domain)
+        if result["verdict"] == "not_configured":
+            raise SkipModule("No threat intelligence key is set on the engine (CYBROT_VT_API_KEY or CYBROT_OTX_API_KEY).")
+        self.results["threat_intel"] = result
+        return len(result["providers"])
 
     def _collect_headers(self):
         try:
