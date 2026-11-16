@@ -7,12 +7,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from . import VERSION, net, report, scanner
+from . import VERSION, collectors, net, report, scanner
 
 HOST = "127.0.0.1"
 MAX_ACTIVE_SCANS = 2
 MAX_BODY_BYTES = 4096
-SCAN_PATH = re.compile(r"^/api/scans/([0-9a-f]{16})(/cancel|/report\.(html|csv|json))?$")
+SCAN_PATH = re.compile(r"^/api/scans/([0-9a-f]{16})(/cancel|/report\.(html|csv|json|pdf))?$")
 
 _jobs = {}
 _jobs_lock = threading.Lock()
@@ -79,6 +79,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, body=report.render_html(view).encode("utf-8"), content_type="text/html; charset=utf-8")
         if fmt == "csv":
             return self._send(200, body=report.render_csv(view).encode("utf-8"), content_type="text/csv; charset=utf-8")
+        if fmt == "pdf":
+            return self._send(200, body=report.render_pdf(view), content_type="application/pdf")
         return self._send(200, body=report.render_json(view).encode("utf-8"))
 
     def do_POST(self):
@@ -124,7 +126,7 @@ class Handler(BaseHTTPRequestHandler):
         if live and not authorized:
             return self._error(
                 400, "AUTHORIZATION_REQUIRED",
-                "Live checks connect to the target. Confirm you own the domain or are authorized to test it.",
+                "Live checks connect to the domain and to the names found for it (up to 25). Confirm you own them or are authorized to test them.",
             )
 
         requested = data.get("modules", scanner.PASSIVE_MODULES)
@@ -151,6 +153,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     server = ThreadingHTTPServer((HOST, args.port), Handler)
     print(f"CYBROT engine {VERSION} on http://{HOST}:{args.port} (passive sources; live checks need authorization)")
+    providers = collectors.configured_threat_keys()
+    if providers:
+        names = ", ".join(collectors.THREAT_NAMES[name] for name in providers)
+        print(f"Threat intelligence: {names} (keys read from environment variables; never sent to the extension)")
+    else:
+        print("Threat intelligence: not configured. Set CYBROT_VT_API_KEY or CYBROT_OTX_API_KEY to enable it.")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
